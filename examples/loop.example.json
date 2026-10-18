@@ -1,0 +1,88 @@
+{
+  "_note": "Trimmed from the running server-health loop. Hostnames, IDs and paths replaced; structure and values otherwise as deployed.",
+  "slug": "fleet-health",
+  "title": "Fleet health: zero red checks on both servers, one daily card, every repair gated",
+  "validated": true,
+  "host": "mac",
+  "host_reasons": [
+    "the health check reaches both servers over SSH; server keys never go to a cloud environment (policy)",
+    "the bot token used for the card lives in the local keychain and is read by name"
+  ],
+  "goal": {
+    "statement": "Every day the health check (24 checks across both servers) reports zero red checks, and one decision card is posted by 10:45 local time with decisions listed apart from FYIs.",
+    "metric": "red_checks",
+    "target": 0,
+    "op": "<=",
+    "deadline": { "daily_at": "10:45" },
+    "source": {
+      "command": "python3 {home}/bin/fleet-check.py --dry-run --json",
+      "json_path": "red_checks",
+      "timeout_s": 180,
+      "on_error_value": null
+    }
+  },
+  "sub_goals": [
+    {
+      "id": "no_red_checks",
+      "weight": 0.3,
+      "tier": 1,
+      "target": 0,
+      "op": "<="
+    },
+    {
+      "id": "backups_fresh",
+      "description": "Freshness, not presence, on all four backup lanes; metric is the count of lanes outside their age threshold.",
+      "weight": 0.15,
+      "tier": 2,
+      "target": 0,
+      "op": "<="
+    }
+  ],
+  "actions": [
+    {
+      "id": "post_daily_card",
+      "cost_turns": 25,
+      "cooldown_h": 20,
+      "fingerprint": "{date}:card",
+      "gate": false,
+      "notes": "The only ungated action. The fingerprint is what stops a second card the same day."
+    },
+    {
+      "id": "prune_docker",
+      "sub_goal": "disk_headroom",
+      "cost_turns": 10,
+      "cooldown_h": 24,
+      "fingerprint": "{date}:prune:{errors_hash}",
+      "gate": true,
+      "preconditions": [
+        { "type": "sub_gap_unmet", "id": "no_red_checks" },
+        { "type": "error_matches", "sub_goal": "no_red_checks", "pattern": "\\b(disk|headroom|disk-forecast)\\b" }
+      ]
+    }
+  ],
+  "forbidden_without_gate": [
+    "restart (any container, service or daemon, on either host)",
+    "prune (image or system prune; volumes are never pruned, gate or no gate)",
+    "patch (package installs or upgrades)",
+    "reboot (either host, for any reason)",
+    "delete (files, dumps, backup objects, platform resources, messages)",
+    "stop (containers, services, sync)",
+    "firewall changes",
+    "DNS changes",
+    "a second card the same day (later runs add buttons to the existing card instead)",
+    "running the health check without --dry-run (it would post its own card)"
+  ],
+  "budget": {
+    "turns_per_run": 40,
+    "runs_per_day": 3,
+    "turns_per_day": 120,
+    "wall_min_per_run": 30
+  },
+  "stop": {
+    "goal_hit": "continue",
+    "goal_hit_mode": "maintenance",
+    "plateau_days": 3,
+    "consecutive_failures": 3,
+    "note": "A day with zero red checks still posts the card: a silent monitor reads like a healthy fleet. Three days with the same red checks and no answered gate is an escalation, not a routine."
+  }
+}

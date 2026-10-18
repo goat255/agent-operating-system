@@ -1,0 +1,1101 @@
+{
+ "name": "Decision router (approval cards)",
+ "nodes": [
+  {
+   "name": "Slack Interaction",
+   "type": "n8n-nodes-base.webhook",
+   "typeVersion": 2.1,
+   "onError": "continueRegularOutput",
+   "position": [
+    0,
+    500
+   ],
+   "parameters": {
+    "httpMethod": "POST",
+    "path": "slack-router",
+    "responseMode": "responseNode",
+    "options": {
+     "rawBody": true
+    }
+   },
+   "id": "2453ecaf-3d70-477e-a1b6-52ce11d0d96e"
+  },
+  {
+   "name": "Ack Slack (empty 200)",
+   "type": "n8n-nodes-base.respondToWebhook",
+   "typeVersion": 1.1,
+   "position": [
+    220,
+    280
+   ],
+   "parameters": {
+    "respondWith": "noData",
+    "options": {
+     "responseCode": 200
+    }
+   },
+   "id": "b4b93edc-3cdc-49f5-92be-f5435c6a0b1b"
+  },
+  {
+   "name": "Verify + Route",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    220,
+    500
+   ],
+   "parameters": {
+    "jsCode": "// ---- Slack signature check (the bot or n8n app) + router for routine-report cards (rr|...) ----\nconst crypto = require('crypto');\nconst item = $input.first();\nconst j = item.json;\nconst headers = j.headers || {};\nconst sig = String(headers['x-slack-signature'] || '');\nconst ts = String(headers['x-slack-request-timestamp'] || '');\nconst secrets = [($vars && $vars.SLACK_BOT_SIGNING_SECRET) || '', ($vars && $vars.SLACK_N8N_SIGNING_SECRET) || ''].filter(s => s.length > 0);\nlet raw = '';\ntry {\n  const bin = item.binary && item.binary.data;\n  if (bin && bin.data) raw = Buffer.from(bin.data, 'base64').toString('utf8');\n  if (raw.length === 0 && this.helpers && this.helpers.getBinaryDataBuffer) {\n    const buf = await this.helpers.getBinaryDataBuffer(0, 'data');\n    raw = buf.toString('utf8');\n  }\n} catch (e) { raw = ''; }\nconst now = Math.floor(Date.now() / 1000);\nconst fresh = ts.length > 0 && Math.abs(now - Number(ts)) < 300;\nlet valid = false;\nif (raw.length > 0 && sig.length > 0 && fresh) {\n  for (const secret of secrets) {\n    const mine = 'v0=' + crypto.createHmac('sha256', secret).update('v0:' + ts + ':' + raw).digest('hex');\n    try { if (sig.length === mine.length && crypto.timingSafeEqual(Buffer.from(mine), Buffer.from(sig))) { valid = true; break; } }\n    catch (e) { /* length mismatch */ }\n  }\n}\nif (!valid) return [];\nlet payload = {};\ntry { payload = JSON.parse(new URLSearchParams(raw).get('payload') || '{}'); } catch (e) { payload = {}; }\n\nconst d = new Date(Date.now() + 5.5 * 3600 * 1000);   // IST wall clock\nconst h = d.getUTCHours(), m = String(d.getUTCMinutes()).padStart(2, '0');\nconst months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];\nconst decided_ist = `${d.getUTCDate()} ${months[d.getUTCMonth()]}, ${(h % 12) || 12}:${m} ${h < 12 ? 'AM' : 'PM'} IST`;\nconst decided_at = new Date().toISOString();\nconst user_id = (payload.user || {}).id || '';\nconst user = (payload.user || {}).username || (payload.user || {}).name || '';\n\n// ---- a submitted modal (steer on a decision, or a session prompt) ----\nif (payload.type === 'view_submission') {\n  const v = payload.view || {};\n  let md = {};\n  try { md = JSON.parse(v.private_metadata || '{}'); } catch (e) { md = {}; }\n  const vals = (v.state && v.state.values) || {};\n  const get = (b, a) => String(((vals[b] || {})[a] || {}).value || '').trim();\n  if (v.callback_id === 'rr_decide') {\n    return [{ json: Object.assign({}, md, { route: 'decide_submit', kind: 'decide', note: get('steer', 'steer_input'),\n      user_id, user, decided_at, decided_ist }) }];\n  }\n  if (v.callback_id === 'rr_session') {\n    return [{ json: Object.assign({}, md, { route: 'session_submit', prompt: get('prompt', 'prompt_input'),\n      user_id, user, requested_at: decided_at, requested_ist: decided_ist }) }];\n  }\n  return [];\n}\nif (payload.type !== 'block_actions') return [];\n\n// ---- a button press ----\nconst action = (payload.actions || [])[0] || {};\nconst action_id = String(action.action_id || '');\nif (!action_id.startsWith('rr|')) return [];\nconst [, kind, ref, choice] = action_id.split('|');\nconst routes = { details: 'details', decide: 'decide_modal', session: 'session_modal', ack: 'decision', snooze: 'decision' };\nif (!routes[kind]) return [];   // rr|link|... and anything unknown: nothing to do\nconst msg = payload.message || {};\nfunction textBefore(blocks) {\n  for (let i = 0; i < blocks.length; i++) {\n    const b = blocks[i];\n    if (b.type === 'actions' && (b.elements || []).some(e => e.action_id === action_id)) {\n      const p = blocks[i - 1];\n      return (p && p.text && p.text.text) ? p.text.text : '';\n    }\n  }\n  return '';\n}\nlet decision_text = textBefore(msg.blocks || []);\nfor (const a of (msg.attachments || [])) if (!decision_text) decision_text = textBefore(a.blocks || []);\nreturn [{ json: {\n  route: routes[kind], kind, ref: ref || '', choice: choice || '', action_id,\n  label: (action.text && action.text.text) || action.value || choice || '',\n  routine: String(ref || '').split('~')[0], user_id, user,\n  channel: (payload.channel || {}).id || (payload.container || {}).channel_id || '',\n  message_ts: msg.ts || (payload.container || {}).message_ts || '',\n  response_url: payload.response_url || '', trigger_id: payload.trigger_id || '',\n  decided_at, decided_ist, decision_text: String(decision_text).slice(0, 1500),\n  blocks: msg.blocks || [], attachments: msg.attachments || [], text: msg.text || ''\n} }];"
+   },
+   "id": "759084ca-e1f3-489f-8eab-4b4d6df491fd"
+  },
+  {
+   "name": "Route",
+   "type": "n8n-nodes-base.switch",
+   "typeVersion": 3.2,
+   "position": [
+    440,
+    500
+   ],
+   "parameters": {
+    "rules": {
+     "values": [
+      {
+       "conditions": {
+        "options": {
+         "caseSensitive": true,
+         "leftValue": "",
+         "typeValidation": "strict",
+         "version": 2
+        },
+        "conditions": [
+         {
+          "leftValue": "={{ $json.route }}",
+          "rightValue": "details",
+          "operator": {
+           "type": "string",
+           "operation": "equals"
+          }
+         }
+        ],
+        "combinator": "and"
+       },
+       "renameOutput": true,
+       "outputKey": "details"
+      },
+      {
+       "conditions": {
+        "options": {
+         "caseSensitive": true,
+         "leftValue": "",
+         "typeValidation": "strict",
+         "version": 2
+        },
+        "conditions": [
+         {
+          "leftValue": "={{ $json.route }}",
+          "rightValue": "decide_modal",
+          "operator": {
+           "type": "string",
+           "operation": "equals"
+          }
+         }
+        ],
+        "combinator": "and"
+       },
+       "renameOutput": true,
+       "outputKey": "decide_modal"
+      },
+      {
+       "conditions": {
+        "options": {
+         "caseSensitive": true,
+         "leftValue": "",
+         "typeValidation": "strict",
+         "version": 2
+        },
+        "conditions": [
+         {
+          "leftValue": "={{ $json.route }}",
+          "rightValue": "session_modal",
+          "operator": {
+           "type": "string",
+           "operation": "equals"
+          }
+         }
+        ],
+        "combinator": "and"
+       },
+       "renameOutput": true,
+       "outputKey": "session_modal"
+      },
+      {
+       "conditions": {
+        "options": {
+         "caseSensitive": true,
+         "leftValue": "",
+         "typeValidation": "strict",
+         "version": 2
+        },
+        "conditions": [
+         {
+          "leftValue": "={{ $json.route }}",
+          "rightValue": "decision",
+          "operator": {
+           "type": "string",
+           "operation": "equals"
+          }
+         }
+        ],
+        "combinator": "and"
+       },
+       "renameOutput": true,
+       "outputKey": "decision"
+      },
+      {
+       "conditions": {
+        "options": {
+         "caseSensitive": true,
+         "leftValue": "",
+         "typeValidation": "strict",
+         "version": 2
+        },
+        "conditions": [
+         {
+          "leftValue": "={{ $json.route }}",
+          "rightValue": "decide_submit",
+          "operator": {
+           "type": "string",
+           "operation": "equals"
+          }
+         }
+        ],
+        "combinator": "and"
+       },
+       "renameOutput": true,
+       "outputKey": "decide_submit"
+      },
+      {
+       "conditions": {
+        "options": {
+         "caseSensitive": true,
+         "leftValue": "",
+         "typeValidation": "strict",
+         "version": 2
+        },
+        "conditions": [
+         {
+          "leftValue": "={{ $json.route }}",
+          "rightValue": "session_submit",
+          "operator": {
+           "type": "string",
+           "operation": "equals"
+          }
+         }
+        ],
+        "combinator": "and"
+       },
+       "renameOutput": true,
+       "outputKey": "session_submit"
+      }
+     ]
+    },
+    "options": {}
+   },
+   "id": "b87af921-e8c9-4c10-9536-156ede684a5b"
+  },
+  {
+   "name": "Get Card",
+   "type": "n8n-nodes-base.dataTable",
+   "typeVersion": 1.1,
+   "EXAMPLE_ID_09": true,
+   "position": [
+    700,
+    0
+   ],
+   "parameters": {
+    "resource": "row",
+    "operation": "get",
+    "dataTableId": {
+     "__rl": true,
+     "value": "EXAMPLE_ID_05",
+     "mode": "id",
+     "EXAMPLE_ID_10": "slack_cards"
+    },
+    "filters": {
+     "conditions": [
+      {
+       "keyName": "ref",
+       "condition": "eq",
+       "keyValue": "={{ $json.ref }}"
+      }
+     ]
+    }
+   },
+   "id": "70cea853-6369-4f7a-9ad1-5032829394af"
+  },
+  {
+   "name": "Build Detail Modal",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    920,
+    0
+   ],
+   "parameters": {
+    "jsCode": "const c = $('Verify + Route').first().json;\nconst r = ($input.all().map(i => i.json).find(x => x && x.ref)) || {};\nconst title = String(r.title || 'Details').slice(0, 24);\nlet s = String(r.detail || '_No stored detail for this card (it may predate the card store)._');\nconst chunks = [];\nwhile (s.length > 0 && chunks.length < 45) {\n  let cut = s.length > 2900 ? s.lastIndexOf('\\n', 2900) : s.length;\n  if (cut < 1000) cut = Math.min(2900, s.length);\n  chunks.push(s.slice(0, cut));\n  s = s.slice(cut).replace(/^\\n+/, '');\n}\nconst blocks = chunks.map(t => ({ type: 'section', text: { type: 'mrkdwn', text: t } }));\nif (r.doc_url) blocks.push({ type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: 'Open full report', emoji: true }, url: r.doc_url }] });\nreturn [{ json: { body: { trigger_id: c.trigger_id, view: { type: 'modal', title: { type: 'plain_text', text: title }, close: { type: 'plain_text', text: 'Close' }, blocks } } } }];"
+   },
+   "id": "58a65d40-37c9-49ff-892e-3a8782486454"
+  },
+  {
+   "name": "views.open (details)",
+   "type": "n8n-nodes-base.httpRequest",
+   "typeVersion": 4.2,
+   "position": [
+    1140,
+    0
+   ],
+   "parameters": {
+    "method": "POST",
+    "url": "https://slack.com/api/views.open",
+    "options": {
+     "response": {
+      "response": {
+       "neverError": true
+      }
+     }
+    },
+    "sendBody": true,
+    "specifyBody": "json",
+    "jsonBody": "={{ JSON.stringify($json.body) }}",
+    "authentication": "predefinedCredentialType",
+    "nodeCredentialType": "slackApi"
+   },
+   "id": "54500f62-53b9-4cab-935f-5cef14d132ae"
+  },
+  {
+   "name": "Assert details",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    1360,
+    0
+   ],
+   "parameters": {
+    "jsCode": "const r = $input.first().json || {};\nif (r.ok === false && r.error !== 'expired_trigger_id') {\n  const msgs = (r.response_metadata && r.response_metadata.messages) ? r.response_metadata.messages.join(' | ') : '';\n  throw new Error('Slack rejected the call: ' + (r.error || 'unknown') + (msgs ? ' | ' + msgs : ''));\n}\nreturn $input.all();"
+   },
+   "id": "05a1e605-f0fd-4d8a-8f1d-61c7cd0b9cb3"
+  },
+  {
+   "name": "Get Card (press)",
+   "type": "n8n-nodes-base.dataTable",
+   "typeVersion": 1.1,
+   "EXAMPLE_ID_09": true,
+   "position": [
+    700,
+    200
+   ],
+   "parameters": {
+    "resource": "row",
+    "operation": "get",
+    "dataTableId": {
+     "__rl": true,
+     "value": "EXAMPLE_ID_05",
+     "mode": "id",
+     "EXAMPLE_ID_10": "slack_cards"
+    },
+    "filters": {
+     "conditions": [
+      {
+       "keyName": "ref",
+       "condition": "eq",
+       "keyValue": "={{ $('Verify + Route').first().json.ref }}"
+      }
+     ]
+    }
+   },
+   "id": "a0db2040-cda3-4f8a-9d38-21d5455c4ec5"
+  },
+  {
+   "name": "Get Routine Cards (press)",
+   "type": "n8n-nodes-base.dataTable",
+   "typeVersion": 1.1,
+   "executeOnce": true,
+   "EXAMPLE_ID_09": true,
+   "position": [
+    900,
+    200
+   ],
+   "parameters": {
+    "resource": "row",
+    "operation": "get",
+    "dataTableId": {
+     "__rl": true,
+     "value": "EXAMPLE_ID_05",
+     "mode": "id",
+     "EXAMPLE_ID_10": "slack_cards"
+    },
+    "returnAll": true,
+    "filters": {
+     "conditions": [
+      {
+       "keyName": "routine",
+       "condition": "eq",
+       "keyValue": "={{ (() => { const r = String($('Verify + Route').first().json.ref || '').split('~')[0]; return [\"apify-daily\", \"claude-janitor\", \"fleet-review\", \"routine-watchdog\"].includes(r) ? r : '~none~'; })() }}"
+      }
+     ]
+    }
+   },
+   "id": "8d0a532f-b2b8-49fb-99b0-7874a1f07801"
+  },
+  {
+   "name": "Get Presses (press)",
+   "type": "n8n-nodes-base.dataTable",
+   "typeVersion": 1.1,
+   "executeOnce": true,
+   "EXAMPLE_ID_09": true,
+   "position": [
+    1100,
+    200
+   ],
+   "parameters": {
+    "resource": "row",
+    "operation": "get",
+    "dataTableId": {
+     "__rl": true,
+     "value": "EXAMPLE_ID_03",
+     "mode": "id",
+     "EXAMPLE_ID_10": "slack_decisions"
+    },
+    "returnAll": true,
+    "filters": {
+     "conditions": [
+      {
+       "keyName": "ref",
+       "condition": "eq",
+       "keyValue": "={{ $('Verify + Route').first().json.ref }}"
+      }
+     ]
+    }
+   },
+   "id": "0aa01c1e-d121-4fcf-9e83-34866c2d9d47"
+  },
+  {
+   "name": "Build Steer Modal",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    1300,
+    200
+   ],
+   "parameters": {
+    "jsCode": "const DECIDE_TTL_DAYS = 7, ALERT_TTL_HOURS = 72;\nconst SUPERSEDE = [\"apify-daily\", \"claude-janitor\", \"fleet-review\", \"routine-watchdog\"];\nconst ROUTINE_NAMES = {\"fleet-review\": \"Server health\", \"fleet-health\": \"Server health loop\", \"fleet-tripwire\": \"Server tripwire\", \"proxy-load\": \"Instagram clearance box\", \"ig-signing\": \"Instagram signing\", \"content-pack-watch\": \"Content pack watch\", \"bot-ask\": \"the bot asks\", \"apify-daily\": \"Apify daily\", \"apify-revenue\": \"Apify revenue loop\", \"apify-discord\": \"Apify Discord\", \"apify-niche-hunt\": \"Apify niche hunt\", \"karakeep-pass\": \"Karakeep\", \"claude-janitor\": \"Weekly janitor\", \"content-pack\": \"Content pack\", \"memory-hygiene\": \"Memory hygiene\", \"memory-capture\": \"Memory capture\", \"routine-watchdog\": \"Routine watchdog\"};\nconst PEOPLE = { example_user: 'goat' };\nconst tms = (v) => { const t = Date.parse(v || ''); return isNaN(t) ? 0 : t; };\nfunction istOf(iso) {\n  const t0 = tms(iso); if (!t0) return '';\n  const t = new Date(t0 + 5.5 * 3600e3), h = t.getUTCHours();\n  const mon = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][t.getUTCMonth()];\n  return `${t.getUTCDate()} ${mon}, ${(h % 12) || 12}:${String(t.getUTCMinutes()).padStart(2, '0')} ${h < 12 ? 'AM' : 'PM'} IST`;\n}\nconst viaOf = (u) => /\\(web\\)\\s*$/.test(String(u || '')) ? 'Inbox' : 'Slack';\nconst whoOf = (u) => { const s = String(u || '').replace(/\\s*\\(web\\)\\s*$/, '').trim(); return PEOPLE[s] || s || 'someone'; };\nconst routineOf = (c) => (c && (c.routine || String(c.ref || '').split('~')[0])) || '';\nfunction specsOf(card) { try { const v = JSON.parse((card && card.decisions) || '[]'); return Array.isArray(v) ? v : []; } catch (e) { return []; } }\nfunction closedOf(card) {\n  if (!card || !card.closed) return null;\n  try { const o = JSON.parse(card.closed); if (o && typeof o === 'object') return o; } catch (e) {}\n  return { reason: String(card.closed) };\n}\nfunction newerOf(card, cards) {\n  const r = routineOf(card);\n  if (!SUPERSEDE.includes(r)) return null;\n  const t = tms(card.created_at);\n  return (cards || []).filter(c => c && c.ref && c.ref !== card.ref && routineOf(c) === r && c.source !== 'backfill' && tms(c.created_at) > t)\n    .sort((a, b) => tms(a.created_at) - tms(b.created_at))[0] || null;\n}\nfunction decisionStates(card, presses, cards, now) {\n  now = now || Date.now();\n  const mine = (presses || []).filter(p => p && p.ref === card.ref && p.kind === 'decide')\n    .sort((a, b) => tms(a.decided_at) - tms(b.decided_at));\n  const closed = closedOf(card), newer = newerOf(card, cards), born = tms(card.created_at);\n  const out = {};\n  for (const s of specsOf(card)) {\n    const id = String(s.id);\n    const p = mine.find(x => String(x.choice).split('.')[0] === id);\n    if (p) out[id] = { state: (p.applied === true || p.applied === 'true') ? 'applied' : 'pressed', label: p.label || '',\n      choice: p.choice, who: whoOf(p.user), via: viaOf(p.user), at: p.decided_at, row: p.id || null, note: p.note || '' };\n    else if (closed) out[id] = { state: 'closed', reason: closed.reason || 'closed', at: closed.at || '' };\n    else if (newer && !s.loop) out[id] = { state: 'superseded', by_ref: newer.ref, by_title: newer.title || '', at: newer.created_at };\n    else if (born && now - born > DECIDE_TTL_DAYS * 864e5) out[id] = { state: 'expired', at: new Date(born + DECIDE_TTL_DAYS * 864e5).toISOString() };\n    else out[id] = { state: 'pending' };\n  }\n  return out;\n}\nfunction alertState(card, presses, now) {   // a red/amber card without decisions: open until acknowledged or snoozed\n  now = now || Date.now();\n  const p = (presses || []).filter(x => x && x.ref === card.ref && (x.kind === 'ack' || x.kind === 'snooze'))\n    .sort((a, b) => tms(a.decided_at) - tms(b.decided_at))[0];\n  if (p) return { state: p.kind === 'ack' ? 'acked' : 'snoozed', who: whoOf(p.user), via: viaOf(p.user), at: p.decided_at, choice: p.choice || '' };\n  if (closedOf(card)) return { state: 'closed', reason: closedOf(card).reason || 'closed' };\n  const born = tms(card.created_at);\n  if (born && now - born > ALERT_TTL_HOURS * 3600e3) return { state: 'expired' };\n  return { state: 'open' };\n}\nfunction stateText(st) {   // the answer to a press on something not pending\n  if (!st) return '';\n  if (st.state === 'pressed' || st.state === 'applied')\n    return `Already handled: ${st.label || st.choice} by ${st.who} via ${st.via}, ${istOf(st.at)}` +\n      (st.state === 'pressed' ? '. Waiting for the routine to apply it' : '. Applied');\n  const name = (ref) => ROUTINE_NAMES[String(ref || '').split('~')[0]] || 'report';\n  if (st.state === 'superseded') return `Closed: superseded by the newer ${name(st.by_ref)} report of ${istOf(st.at)}. Nothing recorded`;\n  if (st.state === 'expired') return `Closed: older than ${DECIDE_TTL_DAYS} days. Nothing recorded`;\n  if (st.state === 'closed') return `Closed: ${st.reason}${st.at ? ', ' + istOf(st.at) : ''}. Nothing recorded`;\n  return '';\n}\nfunction noteFor(st, mention) {   // the context line that replaces a decision's buttons on the Slack card\n  if (st.state === 'pressed' || st.state === 'applied') {\n    let t = `:white_check_mark: *${st.label || st.choice}*, chosen by ${mention || st.who} via ${st.via}, ${istOf(st.at)}`;\n    if (st.note) t += `\\n>${String(st.note).replace(/\\n/g, '\\n>').slice(0, 1500)}`;\n    return t;\n  }\n  if (st.state === 'superseded') return `:lock: Closed without an answer: superseded by the newer report of ${istOf(st.at)}`;\n  if (st.state === 'expired') return `:lock: Closed without an answer: older than ${DECIDE_TTL_DAYS} days`;\n  return `:lock: Closed: ${st.reason || 'closed'}${st.at ? ', ' + istOf(st.at) : ''}`;\n}\n// Rewrite a Slack card so every decision that is no longer pending shows its note instead of buttons. Idempotent:\n// returns null when the card already matches. `append` = a decision id to note at the end when its buttons are not\n// on the card (only the first 10 decisions get buttons).\nfunction syncCard(msg, ref, states, opts) {\n  opts = opts || {};\n  const decOf = (b) => {\n    if (!b || b.type !== 'actions') return null;\n    for (const e of (b.elements || [])) {\n      const p = String(e.action_id || '').split('|');\n      if (p[0] === 'rr' && p[1] === 'decide' && p[2] === ref) return String(p[3] || '').split('.')[0];\n    }\n    return null;\n  };\n  let changed = false, seen = new Set();\n  const note = (did) => ({ type: 'context', elements: [{ type: 'mrkdwn',\n    text: noteFor(states[did], (opts.mention || {})[did]).slice(0, 2900) }] });\n  const rw = (blocks) => (blocks || []).map(b => {\n    const did = decOf(b);\n    if (did === null) return b;\n    seen.add(did);\n    const st = states[did];\n    if (!st || st.state === 'pending') return b;\n    changed = true;\n    return note(did);\n  });\n  const atts = (msg.attachments || []).map(a => {\n    const col = a.color ? (String(a.color).startsWith('#') ? a.color : '#' + a.color) : undefined;\n    return Object.assign({ blocks: rw(a.blocks) }, col ? { color: col } : {}, a.fallback ? { fallback: a.fallback } : {});\n  });\n  const blocks = rw(msg.blocks);\n  if (opts.append && !seen.has(opts.append) && states[opts.append] && states[opts.append].state !== 'pending') {\n    changed = true;\n    if (atts.length) atts[atts.length - 1].blocks.push(note(opts.append)); else blocks.push(note(opts.append));\n  }\n  if (!changed) return null;\n  if (atts.length) return Object.assign({ text: msg.text || 'Updated', attachments: atts }, blocks.length ? { blocks } : {});\n  return { text: msg.text || 'Updated', blocks };\n}\nconst c = $('Verify + Route').first().json;\n// A press on a decision that is no longer pending (pressed in the Inbox or Slack, superseded, expired, closed):\n// no steer modal and no second row; say who handled it, and resync the card so its buttons match the Inbox.\nconst card = $('Get Card (press)').all().map(i => i.json).find(x => x && x.ref === c.ref);\nif (card) {\n  const presses = $('Get Presses (press)').all().map(i => i.json).filter(x => x && x.ref === c.ref);\n  const cards = $('Get Routine Cards (press)').all().map(i => i.json).filter(x => x && x.ref);\n  const st = decisionStates(card, presses, cards)[String(c.choice || '').split('.')[0]];\n  if (st && st.state !== 'pending') {\n    const done = st.state === 'pressed' || st.state === 'applied';\n    const blocks = [];\n    if (c.decision_text) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: String(c.decision_text).slice(0, 2900) } });\n    blocks.push({ type: 'section', text: { type: 'mrkdwn', text: (done ? ':white_check_mark: ' : ':lock: ') + stateText(st) + '.' } });\n    blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: 'Your press was not recorded again. The card now shows the same state as the Decision Inbox.' }] });\n    return [{ json: { resync: true, body: { trigger_id: c.trigger_id, view: { type: 'modal',\n      title: { type: 'plain_text', text: done ? 'Already handled' : 'Closed' }, close: { type: 'plain_text', text: 'OK' }, blocks } } } }];\n  }\n}\nconst md = { ref: c.ref, choice: c.choice, label: c.label, action_id: c.action_id, routine: c.routine,\n             channel: c.channel, message_ts: c.message_ts };\nconst title = String(c.label || 'Confirm').slice(0, 24);\nconst blocks = [];\nif (c.decision_text) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: String(c.decision_text).slice(0, 2900) } });\nblocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `You chose *${String(c.label).slice(0, 60)}*. Add a steer below, or leave it empty and confirm.` }] });\nblocks.push({ type: 'input', block_id: 'steer', optional: true,\n  label: { type: 'plain_text', text: 'Steer (optional)' },\n  element: { type: 'plain_text_input', action_id: 'steer_input', multiline: true,\n             placeholder: { type: 'plain_text', text: `Leave empty to just ${String(c.label).toLowerCase().slice(0, 60)}` } } });\nreturn [{ json: { body: { trigger_id: c.trigger_id, view: { type: 'modal', callback_id: 'rr_decide',\n  private_metadata: JSON.stringify(md).slice(0, 2900),\n  title: { type: 'plain_text', text: title }, submit: { type: 'plain_text', text: 'Confirm' },\n  close: { type: 'plain_text', text: 'Cancel' }, blocks } } } }];"
+   },
+   "id": "4f0ad28a-afa9-43be-9ba4-3c877c3a4abb"
+  },
+  {
+   "name": "views.open (steer)",
+   "type": "n8n-nodes-base.httpRequest",
+   "typeVersion": 4.2,
+   "position": [
+    1500,
+    200
+   ],
+   "parameters": {
+    "method": "POST",
+    "url": "https://slack.com/api/views.open",
+    "options": {
+     "response": {
+      "response": {
+       "neverError": true
+      }
+     }
+    },
+    "sendBody": true,
+    "specifyBody": "json",
+    "jsonBody": "={{ JSON.stringify($json.body) }}",
+    "authentication": "predefinedCredentialType",
+    "nodeCredentialType": "slackApi"
+   },
+   "id": "a674e614-eca6-4590-b466-d28614860c0c"
+  },
+  {
+   "name": "Assert steer modal",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    1700,
+    200
+   ],
+   "parameters": {
+    "jsCode": "const r = $input.first().json || {};\nif (r.ok === false && r.error !== 'expired_trigger_id') {\n  const msgs = (r.response_metadata && r.response_metadata.messages) ? r.response_metadata.messages.join(' | ') : '';\n  throw new Error('Slack rejected the call: ' + (r.error || 'unknown') + (msgs ? ' | ' + msgs : ''));\n}\nreturn $input.all();"
+   },
+   "id": "d1fc942c-5c59-48be-8752-f30db13d82bd"
+  },
+  {
+   "name": "Resync card?",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 2.2,
+   "position": [
+    1900,
+    200
+   ],
+   "parameters": {
+    "conditions": {
+     "options": {
+      "caseSensitive": true,
+      "leftValue": "",
+      "typeValidation": "loose",
+      "version": 2
+     },
+     "conditions": [
+      {
+       "leftValue": "={{ $('Build Steer Modal').first().json.resync === true }}",
+       "rightValue": "",
+       "operator": {
+        "type": "boolean",
+        "operation": "true",
+        "singleValue": true
+       }
+      }
+     ],
+     "combinator": "and"
+    },
+    "options": {}
+   },
+   "id": "11100130-a81f-4769-b15a-e52d5fbcc532"
+  },
+  {
+   "name": "Resync input",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    2100,
+    160
+   ],
+   "parameters": {
+    "jsCode": "const c = $('Verify + Route').first().json;\nreturn [{ json: Object.assign({}, c, { kind: 'sync' }) }];"
+   },
+   "id": "f41fba40-b82a-4dbd-b76c-566467840aef"
+  },
+  {
+   "name": "Apply Decision (sync)",
+   "type": "n8n-nodes-base.executeWorkflow",
+   "typeVersion": 1.2,
+   "position": [
+    2300,
+    160
+   ],
+   "parameters": {
+    "source": "database",
+    "workflowId": {
+     "__rl": true,
+     "value": "EXAMPLE_ID_01",
+     "mode": "id"
+    },
+    "options": {
+     "waitForSubWorkflow": true
+    }
+   },
+   "id": "08653daa-d4f6-4ec7-9089-889954e268b4"
+  },
+  {
+   "name": "Build Session Modal",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    700,
+    400
+   ],
+   "parameters": {
+    "jsCode": "const c = $input.first().json;\nconst md = { ref: c.ref, routine: c.routine, channel: c.channel, message_ts: c.message_ts };\nreturn [{ json: { body: { trigger_id: c.trigger_id, view: { type: 'modal', callback_id: 'rr_session',\n  private_metadata: JSON.stringify(md).slice(0, 2900),\n  title: { type: 'plain_text', text: 'Open a session' }, submit: { type: 'plain_text', text: 'Start' },\n  close: { type: 'plain_text', text: 'Cancel' },\n  blocks: [\n    { type: 'context', elements: [{ type: 'mrkdwn', text: `A new Claude Code session opens on the Mac in the *${c.routine}* routine's folder, with this card's report as context.` }] },\n    { type: 'input', block_id: 'prompt', label: { type: 'plain_text', text: 'What should the session do?' },\n      element: { type: 'plain_text_input', action_id: 'prompt_input', multiline: true,\n                 placeholder: { type: 'plain_text', text: 'e.g. dig into the archive failure and propose a fix' } } }\n  ] } } } }];"
+   },
+   "id": "408ac858-614f-474a-83ca-12b17256f5d1"
+  },
+  {
+   "name": "views.open (session)",
+   "type": "n8n-nodes-base.httpRequest",
+   "typeVersion": 4.2,
+   "position": [
+    920,
+    400
+   ],
+   "parameters": {
+    "method": "POST",
+    "url": "https://slack.com/api/views.open",
+    "options": {
+     "response": {
+      "response": {
+       "neverError": true
+      }
+     }
+    },
+    "sendBody": true,
+    "specifyBody": "json",
+    "jsonBody": "={{ JSON.stringify($json.body) }}",
+    "authentication": "predefinedCredentialType",
+    "nodeCredentialType": "slackApi"
+   },
+   "id": "86023984-023d-4fbc-9d5b-ebee0622dbfe"
+  },
+  {
+   "name": "Assert session modal",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    1140,
+    400
+   ],
+   "parameters": {
+    "jsCode": "const r = $input.first().json || {};\nif (r.ok === false && r.error !== 'expired_trigger_id') {\n  const msgs = (r.response_metadata && r.response_metadata.messages) ? r.response_metadata.messages.join(' | ') : '';\n  throw new Error('Slack rejected the call: ' + (r.error || 'unknown') + (msgs ? ' | ' + msgs : ''));\n}\nreturn $input.all();"
+   },
+   "id": "a6c6e7ed-e69a-4ece-8004-b97133232fb6"
+  },
+  {
+   "name": "Record Tap",
+   "type": "n8n-nodes-base.dataTable",
+   "typeVersion": 1.1,
+   "position": [
+    700,
+    600
+   ],
+   "parameters": {
+    "resource": "row",
+    "operation": "insert",
+    "dataTableId": {
+     "__rl": true,
+     "value": "EXAMPLE_ID_03",
+     "mode": "id",
+     "EXAMPLE_ID_10": "slack_decisions"
+    },
+    "columns": {
+     "mappingMode": "defineBelow",
+     "value": {
+      "ref": "={{ $json.ref }}",
+      "routine": "={{ $json.routine }}",
+      "kind": "={{ $json.kind }}",
+      "choice": "={{ $json.choice }}",
+      "label": "={{ $json.label }}",
+      "user": "={{ $json.user }}",
+      "channel": "={{ $json.channel }}",
+      "message_ts": "={{ $json.message_ts }}",
+      "decided_at": "={{ $json.decided_at }}",
+      "note": "={{ $json.note || '' }}",
+      "applied": "={{ false }}"
+     },
+     "matchingColumns": [],
+     "attemptToConvertTypes": false,
+     "convertFieldsToString": false
+    }
+   },
+   "id": "2ed2b60e-f7f7-4563-9b65-84380df80952"
+  },
+  {
+   "name": "Mark Card (tap)",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    920,
+    600
+   ],
+   "parameters": {
+    "jsCode": "function markCard(c, msg) {\n  const who = c.user_id ? `<@${c.user_id}>` : (c.user || 'someone');\n  let note = c.kind === 'decide' ? `:white_check_mark: *${c.label}*, chosen by ${who}, ${c.decided_ist}`\n    : c.kind === 'ack' ? `:+1: Acknowledged by ${who}, ${c.decided_ist}`\n    : `:zzz: Snoozed for ${c.choice || '?'} h by ${who}, ${c.decided_ist}`;\n  if (c.note) note += `\\n>${String(c.note).replace(/\\n/g, '\\n>').slice(0, 1500)}`;\n  const noteBlock = { type: 'context', elements: [{ type: 'mrkdwn', text: note.slice(0, 2900) }] };\n  // decide: the decision's own actions block becomes the note. ack/snooze: only the ack/snooze buttons go (Details\n  // and Open session stay on the card), the note sits above the remaining row. Web presses match any snooze hours.\n  const tapRe = /^rr\\|(ack|snooze)\\|/;\n  const matches = e => e.action_id === c.action_id ||\n    (c.kind !== 'decide' && tapRe.test(e.action_id || '') && String(e.action_id).split('|')[2] === c.ref);\n  const rewrite = (blocks) => {\n    let hit = false;\n    const out = [];\n    for (const b of (blocks || [])) {\n      if (!hit && b.type === 'actions' && (b.elements || []).some(matches)) {\n        hit = true;\n        out.push(noteBlock);\n        if (c.kind !== 'decide') {\n          const keep = b.elements.filter(e => !tapRe.test(e.action_id || ''));\n          if (keep.length) out.push(Object.assign({}, b, { elements: keep }));\n        }\n        continue;\n      }\n      out.push(b);\n    }\n    return { out, hit };\n  };\n  if ((msg.attachments || []).length > 0) {\n    let any = false;\n    const atts = msg.attachments.map(a => {\n      const r = rewrite(a.blocks);\n      if (r.hit) any = true;\n      const col = a.color ? (String(a.color).startsWith('#') ? a.color : '#' + a.color) : undefined;\n      return Object.assign({ blocks: r.out }, col ? { color: col } : {}, a.fallback ? { fallback: a.fallback } : {});\n    });\n    if (!any) atts[atts.length - 1].blocks.push(noteBlock);\n    return Object.assign({ text: msg.text || 'Updated', attachments: atts }, (msg.blocks || []).length ? { blocks: msg.blocks } : {});\n  }\n  const r = rewrite(msg.blocks);\n  if (!r.hit) r.out.push(noteBlock);\n  return { text: msg.text || 'Updated', blocks: r.out };\n}\nconst c = $('Verify + Route').first().json;\nconst body = Object.assign({ replace_original: true }, markCard(c, { blocks: c.blocks, attachments: c.attachments, text: c.text }));\nreturn [{ json: { response_url: c.response_url, body } }];"
+   },
+   "id": "89f9e064-0ebf-4f93-a1cc-2f808e681084"
+  },
+  {
+   "name": "Update card (response_url)",
+   "type": "n8n-nodes-base.httpRequest",
+   "typeVersion": 4.2,
+   "retryOnFail": true,
+   "maxTries": 3,
+   "EXAMPLE_ID_14": 2000,
+   "position": [
+    1140,
+    600
+   ],
+   "parameters": {
+    "method": "POST",
+    "url": "={{ $json.response_url }}",
+    "options": {
+     "response": {
+      "response": {
+       "neverError": true
+      }
+     }
+    },
+    "sendBody": true,
+    "specifyBody": "json",
+    "jsonBody": "={{ JSON.stringify($json.body) }}"
+   },
+   "id": "e1218627-9a9d-41d3-87aa-eda7448cc1e1"
+  },
+  {
+   "name": "Assert tap",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    1360,
+    600
+   ],
+   "parameters": {
+    "jsCode": "const r = $input.first().json || {};\nif (r.ok === false && r.error !== 'expired_trigger_id') {\n  const msgs = (r.response_metadata && r.response_metadata.messages) ? r.response_metadata.messages.join(' | ') : '';\n  throw new Error('Slack rejected the call: ' + (r.error || 'unknown') + (msgs ? ' | ' + msgs : ''));\n}\nreturn $input.all();"
+   },
+   "id": "5cf4a99e-dc6c-4fd8-bd47-a13e191ebb1c"
+  },
+  {
+   "name": "Apply Decision",
+   "type": "n8n-nodes-base.executeWorkflow",
+   "typeVersion": 1.2,
+   "position": [
+    700,
+    800
+   ],
+   "parameters": {
+    "source": "database",
+    "workflowId": {
+     "__rl": true,
+     "value": "EXAMPLE_ID_01",
+     "mode": "id"
+    },
+    "options": {
+     "waitForSubWorkflow": true
+    }
+   },
+   "id": "9dedf7ee-067c-453d-a225-68bffdc19510"
+  },
+  {
+   "name": "Get Card (session)",
+   "type": "n8n-nodes-base.dataTable",
+   "typeVersion": 1.1,
+   "EXAMPLE_ID_09": true,
+   "position": [
+    700,
+    1000
+   ],
+   "parameters": {
+    "resource": "row",
+    "operation": "get",
+    "dataTableId": {
+     "__rl": true,
+     "value": "EXAMPLE_ID_05",
+     "mode": "id",
+     "EXAMPLE_ID_10": "slack_cards"
+    },
+    "filters": {
+     "conditions": [
+      {
+       "keyName": "ref",
+       "condition": "eq",
+       "keyValue": "={{ $json.ref }}"
+      }
+     ]
+    }
+   },
+   "id": "7b455789-d72d-4b2b-9e9c-535257b88fff"
+  },
+  {
+   "name": "Build Session Request",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    920,
+    1000
+   ],
+   "parameters": {
+    "jsCode": "const c = $('Verify + Route').first().json;\nconst card = ($input.all().map(i => i.json).find(x => x && x.ref)) || {};\nconst context = [card.title ? `Card: ${card.title} (${c.ref})` : `Card ${c.ref}`,\n                 card.doc_url ? `Full report: ${card.doc_url}` : '',\n                 card.detail ? `Card detail:\\n${String(card.detail).slice(0, 6000)}` : ''].filter(Boolean).join('\\n\\n');\nreturn [{ json: { ref: c.ref, routine: c.routine, folder: card.folder || '', prompt: c.prompt, context,\n  user: c.user, requested_at: c.requested_at, status: 'pending', launched_at: '',\n  channel: c.channel, message_ts: c.message_ts, requested_ist: c.requested_ist } }];"
+   },
+   "id": "93a03deb-3a8c-43b7-a33f-2179f71972db"
+  },
+  {
+   "name": "Queue Session",
+   "type": "n8n-nodes-base.dataTable",
+   "typeVersion": 1.1,
+   "position": [
+    1140,
+    1000
+   ],
+   "parameters": {
+    "resource": "row",
+    "operation": "insert",
+    "dataTableId": {
+     "__rl": true,
+     "value": "EXAMPLE_ID_04",
+     "mode": "id",
+     "EXAMPLE_ID_10": "session_requests"
+    },
+    "columns": {
+     "mappingMode": "defineBelow",
+     "value": {
+      "ref": "={{ $json.ref }}",
+      "routine": "={{ $json.routine }}",
+      "folder": "={{ $json.folder }}",
+      "prompt": "={{ $json.prompt }}",
+      "context": "={{ $json.context }}",
+      "user": "={{ $json.user }}",
+      "requested_at": "={{ $json.requested_at }}",
+      "status": "={{ $json.status }}",
+      "launched_at": "={{ $json.launched_at }}"
+     },
+     "matchingColumns": [],
+     "attemptToConvertTypes": false,
+     "convertFieldsToString": false
+    }
+   },
+   "id": "66c25ecb-7177-41a3-95f8-d1b6a154eeaf"
+  },
+  {
+   "name": "Confirm in thread",
+   "type": "n8n-nodes-base.httpRequest",
+   "typeVersion": 4.2,
+   "position": [
+    1360,
+    1000
+   ],
+   "parameters": {
+    "method": "POST",
+    "url": "https://slack.com/api/chat.postMessage",
+    "options": {
+     "response": {
+      "response": {
+       "neverError": true
+      }
+     }
+    },
+    "sendBody": true,
+    "specifyBody": "json",
+    "jsonBody": "={{ JSON.stringify({ channel: $('Build Session Request').first().json.channel, thread_ts: $('Build Session Request').first().json.message_ts, text: ':compass: Session requested by <@' + $('Verify + Route').first().json.user_id + '>, ' + $('Build Session Request').first().json.requested_ist + ': ' + String($('Build Session Request').first().json.prompt).slice(0, 500) + '\\nWithin a minute it appears in the Claude app on the Mac (if awake), prefilled; confirm and press Enter. Folder: ' + ($('Build Session Request').first().json.folder || 'the workspace') }) }}",
+    "authentication": "predefinedCredentialType",
+    "nodeCredentialType": "slackApi"
+   },
+   "id": "08984df2-10cb-40c5-b18f-fee555373bb8"
+  },
+  {
+   "name": "Assert confirm",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    1580,
+    1000
+   ],
+   "parameters": {
+    "jsCode": "const r = $input.first().json || {};\nif (r.ok === false && r.error !== 'expired_trigger_id') {\n  const msgs = (r.response_metadata && r.response_metadata.messages) ? r.response_metadata.messages.join(' | ') : '';\n  throw new Error('Slack rejected the call: ' + (r.error || 'unknown') + (msgs ? ' | ' + msgs : ''));\n}\nreturn $input.all();"
+   },
+   "id": "c9b340af-4388-41ce-9e24-73e317efd169"
+  },
+  {
+   "name": "Overview",
+   "type": "n8n-nodes-base.stickyNote",
+   "typeVersion": 1,
+   "position": [
+    -40,
+    -300
+   ],
+   "parameters": {
+    "width": 900,
+    "height": 260,
+    "content": "## Decision router\n\nEvery button press on an approval card. Answers Slack with an empty 200 first, then verifies the request signature (5-minute window) and routes by action: details opens a modal; decide opens a steer modal and, on submit, records the decision with the optional steer and rewrites the card; ack or snooze records one tap; session queues a follow-up request and confirms in the thread."
+   },
+   "id": "ff19f085-b36d-4ca6-856f-9e0c46a56e4f"
+  }
+ ],
+ "connections": {
+  "Slack Interaction": {
+   "main": [
+    [
+     {
+      "node": "Ack Slack (empty 200)",
+      "type": "main",
+      "index": 0
+     },
+     {
+      "node": "Verify + Route",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Verify + Route": {
+   "main": [
+    [
+     {
+      "node": "Route",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Route": {
+   "main": [
+    [
+     {
+      "node": "Get Card",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Get Card (press)",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Build Session Modal",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Record Tap",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Apply Decision",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Get Card (session)",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Get Card": {
+   "main": [
+    [
+     {
+      "node": "Build Detail Modal",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Build Detail Modal": {
+   "main": [
+    [
+     {
+      "node": "views.open (details)",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "views.open (details)": {
+   "main": [
+    [
+     {
+      "node": "Assert details",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Get Card (press)": {
+   "main": [
+    [
+     {
+      "node": "Get Routine Cards (press)",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Get Routine Cards (press)": {
+   "main": [
+    [
+     {
+      "node": "Get Presses (press)",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Get Presses (press)": {
+   "main": [
+    [
+     {
+      "node": "Build Steer Modal",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Build Steer Modal": {
+   "main": [
+    [
+     {
+      "node": "views.open (steer)",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "views.open (steer)": {
+   "main": [
+    [
+     {
+      "node": "Assert steer modal",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Assert steer modal": {
+   "main": [
+    [
+     {
+      "node": "Resync card?",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Resync card?": {
+   "main": [
+    [
+     {
+      "node": "Resync input",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    []
+   ]
+  },
+  "Resync input": {
+   "main": [
+    [
+     {
+      "node": "Apply Decision (sync)",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Build Session Modal": {
+   "main": [
+    [
+     {
+      "node": "views.open (session)",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "views.open (session)": {
+   "main": [
+    [
+     {
+      "node": "Assert session modal",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Record Tap": {
+   "main": [
+    [
+     {
+      "node": "Mark Card (tap)",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Mark Card (tap)": {
+   "main": [
+    [
+     {
+      "node": "Update card (response_url)",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Update card (response_url)": {
+   "main": [
+    [
+     {
+      "node": "Assert tap",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Get Card (session)": {
+   "main": [
+    [
+     {
+      "node": "Build Session Request",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Build Session Request": {
+   "main": [
+    [
+     {
+      "node": "Queue Session",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Queue Session": {
+   "main": [
+    [
+     {
+      "node": "Confirm in thread",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Confirm in thread": {
+   "main": [
+    [
+     {
+      "node": "Assert confirm",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  }
+ },
+ "settings": {
+  "executionOrder": "v1"
+ }
+}
