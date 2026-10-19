@@ -2,9 +2,9 @@
 
 **Goutam Soni** · October 2026 · [LinkedIn](https://www.linkedin.com/in/goutamsoni/) · [Read as a 4-page PDF](case-study.pdf)
 
-https://github.com/user-attachments/assets/585fe6d3-8972-4f69-aee8-00faa548bb2d
+[![Watch the 87-second explainer: monthly profit from $10 in April to an October pace of about $930, run by agents with a human on every risky step.](media/explainer-poster.jpg)](https://goat255.github.io/agent-operating-system/media/explainer.mp4)
 
-*The 87-second version, with sound ([script](media/explainer-script.md)).*
+*[Watch the 87-second explainer](https://goat255.github.io/agent-operating-system/media/explainer.mp4), with sound ([script](media/explainer-script.md)).*
 
 In April 2026 my catalogue of public data tools made $10 in profit. In October it is on pace for
 about $930. I have not hired anyone. I built it with AI coding agents, and for the last three months
